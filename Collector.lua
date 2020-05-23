@@ -226,14 +226,56 @@ function Collector:SpellStarted(event,unit,target,guid,spellcast)
 	end
 end
 
+--[[ 
+	If you touch something too soon after it was touched, its likely a retry of a failed
+	or interrupted attempt. Don't remember the older timestamp. too soon is less than 4 minutes
+]]
+function Collector:ShouldReplaceOldTimestamp(timestampOld, timestamp)
+	if (timestamp - timestampOld < 240) then
+		return true
+	end
+	return false
+end
+
+--[[
+	Create a new list of 'old timestamps' for this update. if any of
+    the old timestamps is too close to our new timestamp, then don't
+    include them
+]]
+function Collector:UpdateOldTimestamps(oldTimestamps, data, timestamp)
+	local timestampOld = GatherMate:GetTimestampFromNodeData(data) or 0
+	if (timestampOld ~= 0) then
+		if (not Collector:ShouldReplaceOldTimestamp(timestampOld, timestamp)) then
+			table.insert(oldTimestamps, timestampOld)
+		end
+
+		if (data.oldTimestamps) then
+			for _, ts in ipairs(data.oldTimestamps) do
+				if (not Collector:ShouldReplaceOldTimestamp(ts, timestamp)) then
+					table.insert(oldTimestamps, ts)
+				end
+			end
+		end
+	end
+end
+
 --[[
 	add an item to the map (we delgate to GatherMate)
 ]]
 local lastNode = ""
 local lastNodeCoords = 0
 
-function Collector:addItem(skill,what)
+--[[
+	if coordForce, then use the given encoded coordinates instead of
+    the current player coordinates
+]]
+function Collector:addItem(skill,what,coordForce)
 	local x, y, zone = GatherMate.HBD:GetPlayerZonePosition()
+
+    if (coordForce) then
+    	x, y = GatherMate:DecodeLoc(coordForce)
+	end
+
 	if not x or not y then return end -- no valid data
 
 	-- don't collect any data in the garrison, its always the same location and spams the map
@@ -262,6 +304,8 @@ function Collector:addItem(skill,what)
 	local foundCoord = GatherMate:EncodeLoc(x, y)
 	local specialNode = false
 	local specialWhat = what
+	local oldTimestamps = {}
+	local timestampNew = GetServerTime()
 	if foundCoord == lastNodeCoords and what == lastNode then return end
 	--[[ DISABLE SPECIAL NODE PROCESSING FOR HERBS
 	if self.specials[zone] and self.specials[zone][node_type] ~= nil then
@@ -269,8 +313,15 @@ function Collector:addItem(skill,what)
 		specialNode = true
 	end
 	--]]
-	for coord, nodeID in GatherMate:FindNearbyNode(zone, x, y, node_type, range, true) do
+
+	for coord, data in GatherMate:FindNearbyNode(zone, x, y, node_type, range, true) do
+    	local nodeID = GatherMate:GetNodeIDFromNodeData(data)
+
 		if (nodeID == nid or rares[nodeID] and rares[nodeID][nid]) then
+    		if (nodeID == nid) then
+				Collector:UpdateOldTimestamps(ossssldTimestamps, data, timestampNew)
+			end
+
 			GatherMate:RemoveNodeByID(zone, node_type, coord)
 		-- we're trying to add a rare node, but there is already a normal node present, skip the adding
 		elseif rares[nid] and rares[nid][nodeID] then
@@ -283,9 +334,9 @@ function Collector:addItem(skill,what)
 
 	if not skip then
 		if specialNode then
-			GatherMate:AddNode(zone, x, y, node_type, specialWhat)
+			GatherMate:AddNode(zone, x, y, node_type, specialWhat, timestampNew, oldTimestamps)
 		else
-			GatherMate:AddNode(zone, x, y, node_type, what)
+			GatherMate:AddNode(zone, x, y, node_type, what, timestampNew, oldTimestamps)
 		end
 		lastNode = what
 		lastNodeCoords = foundCoord

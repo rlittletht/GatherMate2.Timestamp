@@ -131,10 +131,35 @@ function GatherMate:OnInitialize()
 	end
 end
 
+--[[
+	Some access functions for the tables in the database
+]]
+
+--[[
+	Get the given database from the set of gathermate databases
+]]
+function GatherMate:GetDatabase(database)
+	return self.gmdbs[database]
+end
+
+function GatherMate:GetDatabaseOrEmptyTable(database)
+	return GatherMate:GetDatabase(database) or {}
+end
+
+function GatherMate:GetZone(database, zone)
+	return GatherMate:GetDatabaseOrEmptyTable(database)[zone] 
+end
+
+function GatherMate:GetZoneOrEmptyTable(database, zone)
+	return GatherMate:GetZone(database, zone) or {}
+end
+
 function GatherMate:RemoveGarrisonNodes()
 	for _, database in pairs({"Herb Gathering", "Mining"}) do
-		gmdbs[database][971] = {}
-		gmdbs[database][976] = {}
+    	local db = GatherMate:GetDatabase(database)
+
+		db[971] = {}
+		db[976] = {}
 	end
 end
 
@@ -230,8 +255,8 @@ end
 --[[
 	Add an item to the DB
 ]]
-function GatherMate:AddNode(zone, x, y, nodeType, name)
-	local db = gmdbs[nodeType]
+function GatherMate:AddNode(zone, x, y, nodeType, name, timestamp, oldTimestamps)
+	local db = GatherMate:GetDatabase(nodeType)
 	if not db then return end
 	local id = self:EncodeLoc(x,y)
 	-- db lock check
@@ -239,7 +264,11 @@ function GatherMate:AddNode(zone, x, y, nodeType, name)
 		return
 	end
 	db[zone] = db[zone] or {}
-	db[zone][id] = self.nodeIDs[nodeType][name]
+    local data = {}
+    data.nodeID = self.nodeIDs[nodeType][name]
+    data.timestamp = timestamp or 0
+    data.oldTimestamps = oldTimestamps
+	db[zone][id] = data
 	self:SendMessage("GatherMate2NodeAdded", zone, nodeType, id, name)
 end
 
@@ -250,7 +279,7 @@ end
 	Renamed to InjectNode2/DeleteNode2 to ensure data addon compatibility with 8.0 zone IDs
 ]]
 function GatherMate:InjectNode2(zone, coords, nodeType, nodeID)
-	local db = gmdbs[nodeType]
+	local db = GatherMate:GetDatabase(gmdbs, nodeType)
 	if not db then return end
 	-- db lock check
 	if GatherMate.db.profile.dbLocks[nodeType] then
@@ -258,15 +287,19 @@ function GatherMate:InjectNode2(zone, coords, nodeType, nodeID)
 	end
 	if (nodeType == "Mining" or nodeType == "Herb Gathering") and GatherMate.mapBlacklist[zone] then return end
 	db[zone] = db[zone] or {}
-	db[zone][coords] = nodeID
+    local data = {}
+    data.nodeID = nodeID
+    data.timestamp = 0
+	db[zone][coords] = data
 end
+
 function GatherMate:DeleteNode2(zone, coords, nodeType)
-	if not gmdbs[nodeType] then return end
+	if not GatherMate:GetDatabase(gmdbs, nodeType) then return end
 	-- db lock check
 	if GatherMate.db.profile.dbLocks[nodeType] then
 		return
 	end
-	local db = gmdbs[nodeType][zone]
+	local db = GatherMate:GetZone(gmdbs, nodeType, zone)
 	if db then
 		db[coords] = nil
 	end
@@ -281,10 +314,11 @@ do
 		if not t then return nil end
 		local data = t.data
 		local state, value = next(data, prestate)
+    	local nodeID = GatherMate:GetNodeIDFromNodeData(value)
 		local xLocal, yLocal, yw, yh = t.xLocal, t.yLocal, t.yw, t.yh
 		local radiusSquared, filterTable, ignoreFilter = t.radiusSquared, t.filterTable, t.ignoreFilter
 		while state do
-			if filterTable[value] or ignoreFilter then
+			if filterTable[nodeID] or ignoreFilter then
 				-- inline the :getXY() here in critical minimap update loop
 				local x2, y2 = floor(state/1000000)/10000, floor(state % 1000000 / 100)/10000
 				local x = (x2 - xLocal) * yw
@@ -306,7 +340,7 @@ do
 	function GatherMate:FindNearbyNode(zone, x, y, nodeType, radius, ignoreFilter)
 		local tbl = next(tablestack) or {}
 		tablestack[tbl] = nil
-		tbl.data = gmdbs[nodeType][zone] or emptyTbl
+		tbl.data = GatherMate:GetZoneOrEmptyTable(nodeType, zone)
 		tbl.yw, tbl.yh = self.HBD:GetZoneSize(zone)
 		tbl.radiusSquared = radius * radius
 		tbl.xLocal, tbl.yLocal = x, y
@@ -334,7 +368,7 @@ do
 		This function returns an iterator for the given zone and nodeType
 	]]
 	function GatherMate:GetNodesForZone(zone, nodeType, ignoreFilter)
-		local t = gmdbs[nodeType][zone] or emptyTbl
+		local t = GatherMate:GetZoneOrEmptyTable(nodeType, zone)
 		if ignoreFilter then
 			return pairs(t)
 		else
@@ -355,36 +389,160 @@ end
 --[[
 	Get the name for a nodeID
 ]]
-function GatherMate:GetNameForNode(type, nodeID)
+function GatherMate:GetNameForNode(type, data)
+	local nodeID = GatherMate:GetNodeIDFromNodeData(data)
+
 	return self.reverseNodeIDs[type][nodeID]
 end
+
 --[[
-	Remove an item from the DB
+	Debugging aid -- dump the given table into a printable string
 ]]
-function GatherMate:RemoveNode(zone, x, y, nodeType)
-	if not gmdbs[nodeType] then return end
-	local db = gmdbs[nodeType][zone]
-	local coord = self:EncodeLoc(x,y)
-	if db[coord] then
-		local t = self.reverseNodeIDs[nodeType][db[coord]]
-		db[coord] = nil
-		self:SendMessage("GatherMate2NodeDeleted", zone, nodeType, coord, t)
+function GatherMate:DumpTableToString(o)
+   if type(o) == 'table' then
+	  local s = '{ '
+	  for k,v in pairs(o) do
+		 if type(k) ~= 'number' then k = '"'..k..'"' end
+		 s = s .. '['..k..'] = ' .. GatherMate:DumpTableToString(v) .. ','
+	  end
+	  return s .. '} '
+   else
+	  return tostring(o)
+   end
+end
+
+function GatherMate:GetNameFromNodeData(type, data)
+	return GatherMate:GetNameForNode(type, GatherMate:GetNodeIDFromNodeData(data))
+end
+
+function GatherMate:GetTimestampFromNodeData(data)
+	if (not data) then return nil end
+
+	if (type(data) == 'table') then
+		return data.timestamp
+	else
+		return nil
 	end
 end
---[[
-	Remove an item from the DB by node ID and type
-]]
-function GatherMate:RemoveNodeByID(zone, nodeType, coord)
-	if not gmdbs[nodeType] then return end
+
+function GatherMate:GetNodeIDFromNodeData(data)
+    if (not data) then return nil end
+
+	if (type(data) == 'table') then
+		return data.nodeID
+	elseif (type(data) == 'number') then
+		return data
+	else
+		error("Bad data in db: type: " .. type(data) .. " dump: " .. GatherMate:DumpTableToString(data))
+    	return nil
+	end
+end
+
+function GatherMate:IsNewDataFormat(data)
+    if (type(data) == 'table') then
+    	return true
+	else
+   		return false
+	end 
+end
+
+function GatherMate:NodeDataByCoord(zone, nodeType, coord)
+	if not GatherMate:GetDatabase(nodeType) then 
+		return nil
+	end
+
+	-- db lock check
+	if GatherMate.db.profile.dbLocks[nodeType] then
+		return nil
+	end
+	local db = GatherMate:GetZoneOrEmptyTable(nodeType, zone)
+
+    return db[coord]
+end
+
+function GatherMate:SetNodeDataForCoord(zone, nodeType, coord, data)
+	if not GatherMate:GetDatabase(nodeType) then 
+		return
+	end
+
 	-- db lock check
 	if GatherMate.db.profile.dbLocks[nodeType] then
 		return
 	end
-	local db = gmdbs[nodeType][zone]
-	if db[coord] then
-		local t = self.reverseNodeIDs[nodeType][db[coord]]
-		db[coord] = nil
-		self:SendMessage("GatherMate2NodeDeleted", zone, nodeType, coord, t)
+	local db = GatherMate:GetZoneOrEmptyTable(nodeType, zone)
+    db[coord] = data
+end
+
+
+-- simulate a harvest of this item
+function GatherMate:PingNodeByID(zone, nodeType, coord)
+    local data = GatherMate:NodeDataByCoord(zone, nodeType, coord)
+
+	print("Before: " .. GatherMate:DumpTableToString(data))
+
+    if (data) then
+    	local name = GatherMate:GetNameFromNodeData(nodeType, data)
+
+		local Collector = GatherMate:GetModule("Collector")
+
+    	Collector:addItem(nodeType, name, coord)
+
+		local data2 = GatherMate:NodeDataByCoord(zone, nodeType, coord)
+		print("After: " .. GatherMate:DumpTableToString(data2))
+    	return
+	end
+
+    if (data) then
+    	local nodeID = GatherMate:GetNodeIDFromNodeData(data)
+
+    	local newData = { }
+    	newData.nodeID = nodeID
+    	newData.timestamp = GetServerTime()
+    	
+    	GatherMate:SetNodeDataForCoord(zone, nodeType, coord, newData)
+
+    	local data2 = GatherMate:NodeDataByCoord(zone, nodeType, coord)
+    	print("After: " .. GatherMate:DumpTableToString(data2))
+		self:SendMessage("GatherMate2NodeUpdated", zone, nodeType, coord, t)
+	end
+end
+
+function GatherMate:ResetPingNodeByID(zone, nodeType, coord)
+	local data = GatherMate:NodeDataByCoord(zone, nodeType, coord)
+
+	print("ResetPingNodeByID zone: " .. zone .. " / nodeType: " .. nodeType .. " / coord: " .. coord)
+
+	-- // 1440 / Herb Gathering / 6294618700
+	-- // 1429 / Herb Gathering / 3675580500
+	GatherMate:SetNodeDataForCoord(zone, nodeType, coord, 408)
+	self:SendMessage("GatherMate2NodeUpdated", zone, nodeType, coord, t)
+end
+
+
+--[[
+	Remove an item from the DB
+]]
+function GatherMate:RemoveNode(zone, x, y, nodeType)
+    GatherMate:RemoveNodeByID(zone, nodeType, self:EncodeLoc(x, y))
+end
+
+--[[
+	Remove an item from the DB by node ID and type
+]]
+function GatherMate:RemoveNodeByID(zone, nodeType, coord)
+	if not GatherMate:GetDatabase(nodeType) then return end
+
+	-- db lock check
+	if GatherMate.db.profile.dbLocks[nodeType] then
+		return
+	end
+
+	local data = GatherMate:NodeDataByCoord(zone, nodeType, coord)
+
+	if (data) then
+		GatherMate:SetNodeDataForCoord(zone, nodeType, coord, nil)
+
+		self:SendMessage("GatherMate2NodeDeleted", zone, nodeType, coord, GatherMate:GetNameFromNodeData(nodeType, data))
 	end
 end
 
@@ -425,9 +583,11 @@ function GatherMate:SweepDatabase()
 		coroutine.yield()
 		for profession in pairs(gmdbs) do
 			local range = db.cleanupRange[profession]
-			for coord, nodeID in self:GetNodesForZone(zone, profession, true) do
+			for coord, data in self:GetNodesForZone(zone, profession, true) do
+    			local nodeID = GatherMate:GetNodeIDFromNodeData(data)
 				local x,y = self:DecodeLoc(coord)
-				for _coord, _nodeID in self:FindNearbyNode(zone, x, y, profession, range, true) do
+				for _coord, _data in self:FindNearbyNode(zone, x, y, profession, range, true) do
+    				local _nodeID = GatherMate:GetNodeIDFromNodeData(_data)
 					if coord ~= _coord and (nodeID == _nodeID or (rares[_nodeID] and rares[_nodeID][nodeID])) then
 						self:RemoveNodeByID(zone, profession, _coord)
 					end

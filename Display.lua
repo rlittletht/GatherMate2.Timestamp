@@ -115,13 +115,42 @@ local function showPin(self)
 		end
 
 		local t = db.trackColors
+    	local timestamps = {}
 		local text = format(tooltip_template, t[self.nodeType].Alpha*255, t[self.nodeType].Red*255, t[self.nodeType].Green*255, t[self.nodeType].Blue*255, self.title)
+    	local timestamp = GatherMate:GetTimestampFromNodeData(self.data)
+    	local itemCount = 1
+
+    	if (timestamp) then
+    		local ts = {}
+
+    		ts.title = self.title
+    		ts.timestamp = timestamp
+			table.insert(timestamps, ts)
+		end
+
 		for id, pin in pairs(pinset) do
 			if pin:IsMouseOver() and pin.title and pin ~= self then
 				text = text .. "\n" .. format(tooltip_template, t[pin.nodeType].Alpha*255, t[pin.nodeType].Red*255, t[pin.nodeType].Green*255, t[pin.nodeType].Blue*255, pin.title)
+    			itemCount = itemCount + 1
+    			timestamp = GatherMate:GetTimestampFromNodeData(pin.data)
+				if (timestamp) then
+					local ts = {}
+
+					ts.title = pin.title
+					ts.timestamp = timestamp
+					table.insert(timestamps, ts)
+				end
 			end
 		end
 		GameTooltip:SetText(text)
+
+    	for _, ts in ipairs(timestamps) do
+    		if (itemCount == 1) then
+				GameTooltip:AddLine("Last touch: " .. Display:GetTimeString(ts.timestamp))
+			else
+				GameTooltip:AddLine(ts.title .. ": " .. Display:GetTimeString(ts.timestamp))
+			end
+		end
 		GameTooltip:Show()
 	end
 end
@@ -131,6 +160,7 @@ end
 local function hidePin(self)
 	GameTooltip:Hide()
 end
+
 --[[
 	Pin click handler
 ]]
@@ -141,8 +171,18 @@ local function pinClick(self, button)
 	elseif self.worldmap == false then
 		-- This "simulates" clickthru on the minimap to ping the minimap, by roughknight
 		if Minimap:GetObjectType() == "Minimap" then -- This is for SexyMap's HudMap, which reparents to a hud frame that isn't a minimap
-			local point, parent, relPoint, x, y = self:GetPoint()
-			Minimap:PingLocation(x, y)
+    		if (IsShiftKeyDown()) then
+				if (button == "RightButton") then
+    				print("Resetting object to old-style data format")
+					GatherMate:ResetPingNodeByID(self.zone, self.nodeType, self.coords)
+				else
+    				print("Touching object: zone: " .. self.zone .. " / nodeType: " .. self.nodeType .. " / coords: " .. self.coords)
+					GatherMate:PingNodeByID(self.zone, self.nodeType, self.coords)
+				end
+			else
+				local point, parent, relPoint, x, y = self:GetPoint()
+				Minimap:PingLocation(x, y)
+			end
 		end
 	end
 end
@@ -264,6 +304,7 @@ function Display:RegisterMapEvents()
 	self:RegisterEvent("CVAR_UPDATE", "ChangedVars")
 	self:RegisterMessage("GatherMate2ConfigChanged","ConfigChanged")
 	self:RegisterMessage("GatherMate2NodeAdded", "ScheduleUpdate")
+	self:RegisterMessage("GatherMate2NodeUpdated", "ScheduleUpdate")
 	self:RegisterMessage("GatherMate2DataImport", "DataUpdate")
 	self:RegisterMessage("GatherMate2Cleanup", "DataUpdate")
 	--self:RegisterEvent("ARTIFACT_DIG_SITE_UPDATED","DigsitesChanged")
@@ -471,15 +512,34 @@ end
 --[[
 	Add a new pin to the minimap
 ]]
-function Display:getMiniPin(coord, nodeID, nodeType, zone, index)
+function Display:getMiniPin(coord, data, nodeType, zone, index)
 	local pin = minimapPins[index]
+    local force = false
+
+    if (pin) then
+    	if (not GatherMate:IsNewDataFormat(pin.data)) then
+    		if (GatherMate:IsNewDataFormat(data)) then
+				recyclePin(pin)
+				pin = nil
+			end
+   		else
+    		-- check to see if the timestamp change
+    		if (not GatherMate:IsNewDataFormat(data) or pin.data.timestamp ~= data.timestamp) then
+    			recyclePin(pin)
+    			pin = nil
+			end
+		end
+	end
+
 	if not pin then
+    	local nodeID = GatherMate:GetNodeIDFromNodeData(data)
 		pin = self:getMapPin()
 		pin.coords = coord
 		pin.title = GatherMate:GetNameForNode(nodeType, nodeID)
 		pin.zone = zone
 		pin.nodeID = nodeID
 		pin.nodeType = nodeType
+		pin.data = data
 		pin.worldmap = false
 		pin:SetParent(Minimap)
 		pin:SetFrameStrata(minimapStrata)
@@ -507,7 +567,12 @@ function Display:addMiniPin(pin, refresh)
 	if (not pin.isCircle or refresh) and trackShow[pin.nodeType] and dist_2 <= db.trackDistance^2 then
 		pin.texture:SetTexture(trackingCircle)
 		local t = db.trackColors[pin.nodeType]
-		pin.texture:SetVertexColor(t.Red, t.Green, t.Blue, t.Alpha)
+    	local alpha = t.Alpha
+    	if not GatherMate:GetTimestampFromNodeData(pin.data or {}) then
+    		alpha = .5
+		end
+
+		pin.texture:SetVertexColor(t.Red, t.Green, t.Blue, alpha)
 		pin:SetHeight(10 / minimapScale)
 		pin:SetWidth(10 / minimapScale)
 		pin.isCircle = true
@@ -517,7 +582,11 @@ function Display:addMiniPin(pin, refresh)
 		pin:SetHeight(12 * db.miniscale / minimapScale)
 		pin:SetWidth(12 * db.miniscale / minimapScale)
 		pin.texture:SetTexture(nodeTextures[pin.nodeType][pin.nodeID])
-		pin.texture:SetVertexColor(1, 1, 1, 1)
+		local alpha = 1
+		if not GatherMate:GetTimestampFromNodeData(pin.data or {}) then
+			alpha = .5
+		end
+		pin.texture:SetVertexColor(1, 1, 1, alpha)
 		pin.texture:SetTexCoord(0, 1, 0, 1)
 		pin.isCircle = false
 	end
@@ -669,6 +738,38 @@ function Display:UpdateIconPositions()
 end
 
 --[[
+	Convert the given timestamp into a delta from the current server time
+]]
+function Display:GetTimeString(timestamp)
+    local now = GetServerTime()
+
+    local dSeconds = now - timestamp
+
+    if (dSeconds < 60) then
+    	return tostring(dSeconds) .. " seconds ago"
+	end
+
+    local dMinutes = math.floor(dSeconds / 6 + 0.5) / 10
+    if (dMinutes < 120) then
+    	return tostring(dMinutes) .. " minutes ago"
+	end
+
+    local dHours = math.floor(dMinutes / 6 + 0.5) / 10
+    if (dHours < 36) then
+    	return tostring(dHours) .. " hours ago"
+	end
+    
+    local dDays = math.floor(dHours / 2.4 + 0.5) / 10
+    if (dDays < 7) then
+		return tostring(dDays) .. " days ago"
+	end
+
+    local dateTime = date("*t", timestamp)
+
+    return format("%d/%d/%d %02d:%02d", dateTime.month, dateTime.day, dateTime.year, dateTime.hour, dateTime.min)
+end
+
+--[[
 	Update the minimap
 	we only care about nodes 1000 yards away
 ]]
@@ -739,8 +840,8 @@ function Display:UpdateMiniMap(force)
 		-- iterate the node databases and add the nodes
 		for i,db_type in pairs(GatherMate.db_types) do
 			if GatherMate.Visible[db_type] then
-				for coord, nodeID in GatherMate:FindNearbyNode(zone, x1, y1, db_type, mapRadius*nodeRange) do
-					local pin = self:getMiniPin(coord, nodeID, db_type, zone, (i * 1e14) + coord)
+				for coord, data in GatherMate:FindNearbyNode(zone, x1, y1, db_type, mapRadius*nodeRange) do
+					local pin = self:getMiniPin(coord, data, db_type, zone, (i * 1e14) + coord)
 					pin.keep = true
 					self:addMiniPin(pin, force)
 				end
@@ -786,8 +887,8 @@ function Display.WorldMapDataProvider:RefreshAllData(fromOnShow)
 	-- iterate databases and add nodes
 	for i,db_type in pairs(GatherMate.db_types) do
 		if GatherMate.Visible[db_type] then
-			for coord, nodeID in GatherMate:GetNodesForZone(uiMapID, db_type) do
-				local pin = self:GetMap():AcquirePin("GatherMate2WorldMapPinTemplate", coord,  nodeID, db_type, uiMapID)
+			for coord, data in GatherMate:GetNodesForZone(uiMapID, db_type) do
+				local pin = self:GetMap():AcquirePin("GatherMate2WorldMapPinTemplate", coord, data, db_type, uiMapID)
 				table.insert(worldmapPins, pin)
 			end
 		end
@@ -802,11 +903,13 @@ function GatherMate2WorldMapPinMixin:OnLoad()
 	self:SetScalingLimits(1, 1.0, 1.2);
 end
 
-function GatherMate2WorldMapPinMixin:OnAcquired(coord, nodeID, nodeType, zone)
+function GatherMate2WorldMapPinMixin:OnAcquired(coord, data, nodeType, zone)
+    local nodeID = GatherMate:GetNodeIDFromNodeData(data)
 	local x,y = GatherMate:DecodeLoc(coord)
 	self:SetPosition(x, y)
 
 	self.coords = coord
+    self.data = data
 	self.title = GatherMate:GetNameForNode(nodeType, nodeID)
 	self.zone = zone
 	self.nodeID = nodeID
